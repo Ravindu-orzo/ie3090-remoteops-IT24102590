@@ -12,6 +12,17 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 
+/*
+ * [Lecture 03: TCP client/server steps]
+ * The controller is the CLIENT and the agent is the SERVER. A server
+ * uses a fixed, well-known port so clients know where to connect; a
+ * client does not choose a port, the OS gives it a temporary
+ * (ephemeral) one automatically. A socket address = IP address +
+ * port number.
+ *
+ * 127.0.0.1 is the loopback address, meaning "this same computer".
+ * The port here must match PORT in agent_590.c.
+ */
 #define SERVER_IP "127.0.0.1"
 #define SERVER_PORT 9410
 
@@ -27,6 +38,19 @@ static pthread_t udp_thread;
 
 /* ---------------- SEND ALL ---------------- */
 
+/*
+ * [Lecture 02: writen()]
+ * TCP is a byte stream, and send() may transfer FEWER bytes than
+ * requested (kernel buffer limits). This is not an error, so we loop
+ * and send only what is left until everything is delivered. 'sent'
+ * counts bytes already delivered; buffer + sent points to the next
+ * unsent byte.
+ *
+ * If a signal interrupts the call, send() returns -1 with errno =
+ * EINTR. That is not a real failure, so we just call it again. Any
+ * other failure returns -1. This is the same structure as the
+ * lecture's writen().
+ */
 int send_all(int fd, const void *data, size_t length)
 {
     size_t sent = 0;
@@ -55,6 +79,12 @@ int send_all(int fd, const void *data, size_t length)
 
 /* ---------------- SEND LINE ---------------- */
 
+/*
+ * [Lecture 02: byte stream needs its own message boundary]
+ * TCP does not keep message boundaries, so this program ends every
+ * command with a newline. This helper adds the '\n' if it is missing
+ * and then sends the whole line with send_all().
+ */
 int send_line(int fd, const char *line)
 {
     size_t len = strlen(line);
@@ -73,6 +103,21 @@ int send_line(int fd, const char *line)
 
 /* ---------------- RECEIVE LINE ---------------- */
 
+/*
+ * [Lecture 02: readline() Version 1]
+ * Reads ONE byte per recv() call until a newline arrives (the
+ * lecture's readline Version 1: simple, but one system call per
+ * byte, which is fine for short command lines).
+ *
+ * recv() returns 0 when the other side closed the connection (EOF,
+ * the FIN arrived), so we return 0 if nothing was read yet. -1 is a
+ * real error, except EINTR which we retry.
+ *
+ * 'pos < size - 1' keeps room for the terminating '\0' and stops the
+ * buffer from overflowing (lecture: make sure buffers cannot be
+ * overflowed). Difference from the lecture: '\r' is skipped and the
+ * '\n' is not stored.
+ */
 int recv_line(int fd, char *buffer, size_t size)
 {
     size_t pos = 0;
@@ -113,6 +158,15 @@ int recv_line(int fd, char *buffer, size_t size)
 
 /* ---------------- RECEIVE EXACT BYTES ---------------- */
 
+/*
+ * [Lecture 02: readn()]
+ * Keeps calling recv() until EXACTLY 'length' bytes have arrived,
+ * because one recv() may return fewer bytes than requested. Used for
+ * file downloads, where the size is known in advance.
+ *
+ * Difference from the lecture's readn(): EOF (n == 0) is treated as
+ * a failure here, since a half-received file is useless.
+ */
 int recv_exact(int fd, void *data, size_t length)
 {
     size_t received = 0;
@@ -144,6 +198,14 @@ int recv_exact(int fd, void *data, size_t length)
 
 /* ---------------- UDP MONITOR THREAD ---------------- */
 
+/*
+ * [Lecture 05: I/O multiplexing with select()]
+ * This thread receives the UDP monitoring packets sent by the agent.
+ * By default sockets use blocking I/O (recvfrom would wait forever).
+ * select() waits on a set of descriptors and returns when one is
+ * ready OR when the timeout expires, so the loop can regularly re-
+ * check 'udp_running' and stop quickly when MONITOR STOP is used.
+ */
 void *udp_listener(void *arg)
 {
     (void)arg;
@@ -152,6 +214,19 @@ void *udp_listener(void *arg)
 
     while (udp_running) {
 
+        /*
+         * [Lecture 05: fd_set macros and the timeout]
+         * fd_set is a set of descriptors. FD_ZERO empties the set and FD_SET
+         * adds our UDP socket to it. select() modifies both the set and the
+         * timeout, so they are declared and rebuilt inside the loop on every
+         * pass.
+         *
+         * select(maxfd1, readset, writeset, exceptset, timeout): maxfd1 =
+         * highest descriptor + 1, and the timeout of 1 second means "wait up
+         * to 1 second". It returns the number of ready descriptors, 0 on
+         * timeout, or -1 on error, so 'result <= 0' means nothing to read
+         * this round.
+         */
         fd_set readfds;
 
         FD_ZERO(&readfds);
@@ -172,6 +247,14 @@ void *udp_listener(void *arg)
         if (result <= 0)
             continue;
 
+        /*
+         * [Lecture 05 / Lecture 02: FD_ISSET and recvfrom()]
+         * FD_ISSET tests whether our socket is ready (readable). Only then
+         * do we call recvfrom(), so it will not block.
+         *
+         * recvfrom() is a value-result call (kernel to process). The two
+         * NULL arguments mean we do not care who sent the packet.
+         */
         if (FD_ISSET(udp_socket_fd, &readfds)) {
 
             ssize_t n =
@@ -200,6 +283,14 @@ void *udp_listener(void *arg)
 
 /* ---------------- PUT FILE ---------------- */
 
+/*
+ * [Lecture 02: sending a file over a byte stream]
+ * Because reads and writes can be partial, the file is sent in two
+ * steps: first a header line announcing the file size ("PUT name
+ * size"), then exactly that many bytes. 'remaining' tracks how many
+ * bytes are still to send, and each chunk (at most BUFFER_SIZE) goes
+ * out through send_all().
+ */
 void put_file(int sock)
 {
     char filename[256];
@@ -287,6 +378,13 @@ void put_file(int sock)
 
 /* ---------------- GET FILE ---------------- */
 
+/*
+ * [Lecture 02: receiving a file over a byte stream]
+ * The agent first replies with a header line ("OK FILE_SEND name
+ * size"). We read the size from it, then loop receiving exactly that
+ * many bytes with recv_exact(), in chunks of at most BUFFER_SIZE,
+ * until 'remaining' reaches zero.
+ */
 void get_file(int sock)
 {
     char filename[256];
@@ -382,6 +480,13 @@ void get_file(int sock)
 
 /* ---------------- CONNECT ---------------- */
 
+/*
+ * [Lecture 03: client steps (socket, then connect)]
+ * Client steps: 1) socket() creates the TCP endpoint, 2) connect()
+ * starts the three-way handshake (SYN, SYN-ACK, ACK) with the
+ * server. Note there is no bind() here: a client does not need one,
+ * the OS picks an ephemeral port.
+ */
 int connect_server(void)
 {
     int sock =
@@ -395,6 +500,17 @@ int connect_server(void)
         return -1;
     }
 
+    /*
+     * [Lecture 02: socket address structure, byte order, address conversion]
+     * struct sockaddr_in holds the server's address: sin_family (AF_INET
+     * = IPv4), sin_port and sin_addr. memset() clears the WHOLE
+     * structure first (sin_zero must be 0).
+     *
+     * Ports must be in network byte order (big-endian, as the Internet
+     * uses), so htons() converts the port from host order. inet_pton()
+     * converts the text "127.0.0.1" into the 32-bit binary address and
+     * stores it in sin_addr (p = presentation, n = numeric).
+     */
     struct sockaddr_in server;
 
     memset(&server,
@@ -411,6 +527,17 @@ int connect_server(void)
               SERVER_IP,
               &server.sin_addr);
 
+    /*
+     * [Lecture 03/04: connect() and its failure rule]
+     * connect() takes the socket, a pointer to the server address (cast
+     * to the generic struct sockaddr *, which all socket functions
+     * expect) and the structure length (a plain value, process to
+     * kernel). It returns 0 on success, -1 on failure.
+     *
+     * After a failed connect() the same socket cannot be reused (lecture
+     * 04), so we close it and return -1; a retry must create a new
+     * socket.
+     */
     if (connect(sock,
                 (struct sockaddr *)&server,
                 sizeof(server)) < 0) {
@@ -427,6 +554,12 @@ int connect_server(void)
 
 /* ---------------- BAD AUTH TEST ---------------- */
 
+/*
+ * [Lecture 03: full client life cycle]
+ * A minimal client: connect, send one line, read one reply, close().
+ * close() lowers the descriptor's reference count and, when it
+ * reaches 0, TCP starts its FIN termination sequence.
+ */
 void bad_auth_test(void)
 {
     int sock = connect_server();
@@ -477,6 +610,13 @@ int main(int argc, char *argv[])
     printf("SID    : %s\n", SID);
     printf("====================================\n");
 
+    /*
+     * [Lecture 03: TCP client communication flow]
+     * After connect() the client talks to the server with send/recv:
+     * write a request, read the response, repeat, and finally close().
+     * The first request here is the AUTH line; every later command is
+     * only accepted by the agent after it succeeds.
+     */
     /* AUTH */
 
     send_line(sock,
@@ -528,6 +668,13 @@ int main(int argc, char *argv[])
 
         int choice;
 
+        /*
+         * [Lecture 05: blocking I/O and stop-and-wait]
+         * The menu uses ordinary blocking calls and works in stop-and-wait
+         * mode: send ONE request, then wait for ONE reply before doing
+         * anything else. Simple, but the program cannot react to anything
+         * else (e.g. the server closing) while it waits.
+         */
         if (scanf("%d", &choice) != 1)
             break;
 
@@ -597,6 +744,17 @@ int main(int argc, char *argv[])
             get_file(sock);
         }
 
+        /*
+         * [Lecture 03/02: UDP receiver]
+         * MONITOR START: UDP (SOCK_DGRAM) is connectionless and unreliable
+         * (no handshake, no listen/accept/connect), which suits periodic
+         * status readings because a lost one is replaced 2 seconds later.
+         *
+         * The receiver must bind() to a port so the sender knows where to
+         * send. We therefore create and bind the UDP socket FIRST, start the
+         * udp_listener thread, and only then tell the agent over TCP to
+         * start sending.
+         */
         else if (choice == 6) {
 
             int port;
@@ -638,6 +796,14 @@ int main(int argc, char *argv[])
             local.sin_port =
                 htons(port);
 
+            /*
+             * [Lecture 03/02: bind() for the UDP socket]
+             * bind() assigns a local address to the socket: INADDR_ANY means
+             * "any local network interface", htons(port) is the port in network
+             * byte order, and the cast to struct sockaddr * plus sizeof() is the
+             * usual generic-address pattern. Returns 0 on success, -1 on
+             * failure.
+             */
             if (bind(udp_socket_fd,
                      (struct sockaddr *)&local,
                      sizeof(local)) < 0) {
@@ -712,6 +878,12 @@ int main(int argc, char *argv[])
             }
         }
 
+        /*
+         * [Lecture 04: closing the connection]
+         * Graceful exit: send QUIT, read "OK BYE", leave the loop, and
+         * close(sock) at the end of main. When the agent sees the close, its
+         * recv() returns 0 (EOF) and its handler ends.
+         */
         else if (choice == 8) {
 
             send_line(sock,
