@@ -18,10 +18,24 @@
 #include <netinet/in.h>
 #include <semaphore.h>
 
+/*
+ * [Lecture 03: well-known server port]
+ * The server listens on a fixed, well-known port so clients know
+ * where to connect. A socket address = IP address + port number. The
+ * controller uses the same number (SERVER_PORT in controller_590.c).
+ */
 #define PORT 9410
 #define SID "0952"
 #define AUTH_TOKEN "OPS-2590"
 
+/*
+ * [Lecture 03 / Lecture 05: backlog and limiting connections]
+ * Used in two ways: as the listen() backlog (the length of the queue
+ * of waiting connections; 5 is the historical value) and as the cap
+ * on simultaneous clients (see client_slots in main). Lecture 05
+ * lists limiting the number of connections as a defence against
+ * denial-of-service.
+ */
 #define MAX_CLIENTS 5
 #define MAX_LINE 8192
 #define MAX_FILE_SIZE (10 * 1024 * 1024)
@@ -67,6 +81,19 @@ void log_event(const char *format, ...)
 
 /* -------------------- SEND ALL -------------------- */
 
+/*
+ * [Lecture 02: writen()]
+ * TCP is a byte stream, and send() may transfer FEWER bytes than
+ * requested (kernel buffer limits). This is not an error, so we loop
+ * and send only what is left until everything is delivered. 'sent'
+ * counts bytes already delivered; buffer + sent points to the next
+ * unsent byte.
+ *
+ * If a signal interrupts the call, send() returns -1 with errno =
+ * EINTR. That is not a real failure, so we just call it again. Any
+ * other failure returns -1. This is the same structure as the
+ * lecture's writen().
+ */
 int send_all(int fd, const void *data, size_t length)
 {
     size_t sent = 0;
@@ -90,6 +117,12 @@ int send_all(int fd, const void *data, size_t length)
 
 /* -------------------- SEND LINE -------------------- */
 
+/*
+ * [Lecture 02: byte stream needs its own message boundary]
+ * TCP does not keep message boundaries, so every reply ends with a
+ * newline. This helper formats the text, adds the '\n' if it is
+ * missing and sends the whole line with send_all().
+ */
 int send_line(int fd, const char *format, ...)
 {
     char buffer[MAX_LINE];
@@ -115,6 +148,21 @@ int send_line(int fd, const char *format, ...)
 
 /* -------------------- RECEIVE ONE LINE -------------------- */
 
+/*
+ * [Lecture 02: readline() Version 1]
+ * Reads ONE byte per recv() call until a newline arrives (the
+ * lecture's readline Version 1: simple, but one system call per
+ * byte, which is fine for short command lines).
+ *
+ * recv() returns 0 when the other side closed the connection (EOF,
+ * the FIN arrived), so we return 0 if nothing was read yet. -1 is a
+ * real error, except EINTR which we retry.
+ *
+ * 'pos < size - 1' keeps room for the terminating '\0' and stops the
+ * buffer from overflowing (lecture: make sure buffers cannot be
+ * overflowed). Difference from the lecture: '\r' is skipped and the
+ * '\n' is not stored.
+ */
 int recv_line(int fd, char *buffer, size_t size)
 {
     size_t pos = 0;
@@ -153,6 +201,13 @@ int recv_line(int fd, char *buffer, size_t size)
 
 /* -------------------- RECEIVE EXACT BYTES -------------------- */
 
+/*
+ * [Lecture 02: readn()]
+ * Keeps calling recv() until EXACTLY 'length' bytes have arrived,
+ * because one recv() may return fewer bytes than requested. EOF (n
+ * == 0) is treated as a failure here, unlike the lecture's readn()
+ * which returns the partial count.
+ */
 int recv_exact(int fd, void *data, size_t length)
 {
     size_t received = 0;
@@ -383,6 +438,18 @@ void handle_exec(int fd, const char *command)
 
 /* -------------------- PUT FILE -------------------- */
 
+/*
+ * [Lecture 02: receiving a file over a byte stream]
+ * The controller first sends a header line ("PUT name size"), then
+ * exactly 'size' bytes. Because recv() can return fewer bytes than
+ * requested, we loop: 'remaining' is the number of bytes still
+ * expected, each recv() reduces it, and the loop ends when it
+ * reaches zero. If recv() returns 0 or -1 before that, the
+ * connection died mid-transfer and the partial file is removed.
+ *
+ * The size and filename are validated first and buffers are bounded
+ * (lecture: check return values, never allow buffer overflow).
+ */
 int handle_put(int fd, const char *request)
 {
     char filename[101];
@@ -493,6 +560,13 @@ int handle_put(int fd, const char *request)
 
 /* -------------------- GET FILE -------------------- */
 
+/*
+ * [Lecture 02: sending a file over a byte stream]
+ * Mirror image of PUT: first send a header line announcing the file
+ * name and size ("OK FILE_SEND name size"), then send exactly that
+ * many bytes in chunks of at most 8192, using send_all() so partial
+ * sends are handled. 'remaining' tracks the bytes still to send.
+ */
 int handle_get(int fd, const char *request)
 {
     char filename[101];
@@ -629,6 +703,14 @@ typedef struct {
 
 /* UDP monitoring thread */
 
+/*
+ * [Lecture 03/02: UDP sender]
+ * UDP (SOCK_DGRAM) is connectionless and unreliable: no handshake,
+ * no listen/accept/connect, and packets may be lost. That suits
+ * periodic status readings, since a lost one is replaced 2 seconds
+ * later. This thread sends one SYSINFO datagram roughly every 2
+ * seconds until 'stop' is set.
+ */
 void *monitor_thread(void *arg)
 {
     ClientContext *ctx =
@@ -658,6 +740,14 @@ void *monitor_thread(void *arg)
                  info,
                  SID);
 
+        /*
+         * [Lecture 02: sendto() (process to kernel)]
+         * sendto() sends one datagram to the destination address given in
+         * udp_address. The address length is passed as a plain value
+         * (sizeof), because this is process to kernel; the cast to struct
+         * sockaddr * is the generic-address pattern. No bind() is needed for
+         * the sender, the OS gives the UDP socket an ephemeral port.
+         */
         sendto(udp_fd,
                packet,
                strlen(packet),
@@ -752,6 +842,14 @@ int start_monitor(ClientContext *ctx,
     ctx->udp_address.sin_port =
         htons((uint16_t)udp_port);
 
+    /*
+     * [Lecture 02: inet_pton()]
+     * inet_pton() converts the controller's IP address text (e.g.
+     * "127.0.0.1") into the 32-bit binary form stored in sin_addr. It
+     * returns 1 on success, so anything other than 1 means failure.
+     * Together with memset() above and htons() on the port, this fills
+     * the sockaddr_in destination used by sendto().
+     */
     if (inet_pton(AF_INET,
                   ctx->client_ip,
                   &ctx->udp_address.sin_addr) != 1) {
@@ -795,6 +893,18 @@ int start_monitor(ClientContext *ctx,
 
 /* -------------------- CLIENT THREAD -------------------- */
 
+/*
+ * [Lecture 04: the per-client worker (thread version of the fork child)]
+ * Concurrent server idea: the main loop only accepts connections and
+ * hands each one to a worker, then goes straight back to accept().
+ * The lecture does this with fork(); this agent uses one THREAD per
+ * client. This function is the worker: it serves one connected
+ * socket until the client leaves.
+ *
+ * Because each client has its own thread, a slow or silent client
+ * blocks only its own thread (lecture 05: one defence against
+ * denial-of-service).
+ */
 void *client_handler(void *arg)
 {
     ClientContext *ctx =
@@ -811,6 +921,13 @@ void *client_handler(void *arg)
 
     while (1) {
 
+        /*
+         * [Lecture 04: detecting that the client left (EOF)]
+         * Like str_echo() in the lecture's echo server: read a line, act on
+         * it, repeat. recv_line() returns 0 when the client closed the
+         * connection (FIN received) and -1 on error, so 'result <= 0' ends
+         * the loop and the cleanup below runs.
+         */
         int result =
             recv_line(fd,
                       line,
@@ -987,6 +1104,17 @@ void *client_handler(void *arg)
 
     stop_monitor(ctx);
 
+    /*
+     * [Lecture 04: closing the connected socket]
+     * Cleanup for this client. close(fd) lowers the descriptor's
+     * reference count and, at 0, the real close happens and TCP's FIN
+     * sequence starts. Every connected socket returned by accept() must
+     * be closed, otherwise the server eventually runs out of
+     * descriptors.
+     *
+     * sem_post() frees this client's slot so another client may be
+     * served.
+     */
     log_event("Client disconnected: %s",
               ctx->client_ip);
 
@@ -1005,6 +1133,16 @@ void *client_handler(void *arg)
 
 int main(void)
 {
+    /*
+     * [Lecture 04: signal disposition]
+     * A signal is a software notification. Each signal has a
+     * disposition: run a handler function, ignore it (SIG_IGN) or use
+     * the default (SIG_DFL). Here the agent chooses to IGNORE SIGPIPE.
+     * (SIGPIPE itself is not covered in the lectures; the lecture
+     * example is SIGCHLD.) Without this, writing to a connection the
+     * other side already closed could kill the whole agent; now send()
+     * just returns -1, which send_all() handles.
+     */
     signal(SIGPIPE, SIG_IGN);
 
     mkdir("agentfiles", 0755);
@@ -1024,6 +1162,14 @@ int main(void)
              0,
              MAX_CLIENTS);
 
+    /*
+     * [Lecture 03: socket()]
+     * Server step 1: socket(family, type, protocol) creates the endpoint
+     * and returns a socket descriptor (or -1 on failure). AF_INET =
+     * IPv4, SOCK_STREAM = TCP (reliable byte stream), protocol 0 =
+     * default. This is the LISTENING socket; it is only used to accept
+     * new connections.
+     */
     int server_fd =
         socket(AF_INET,
                SOCK_STREAM,
@@ -1046,6 +1192,16 @@ int main(void)
                &reuse,
                sizeof(reuse));
 
+    /*
+     * [Lecture 02: socket address structure and byte order]
+     * sockaddr_in holds this server's own address. memset() clears the
+     * whole structure (sin_zero must be 0). sin_family = AF_INET (IPv4).
+     * INADDR_ANY means "accept connections on any local network
+     * interface" (the lecture writes htonl(INADDR_ANY); here htonl is
+     * omitted, which is fine because INADDR_ANY is 0 and 0 is the same
+     * in both byte orders). htons(PORT) converts the port to network
+     * byte order (big-endian).
+     */
     struct sockaddr_in server_address;
 
     memset(&server_address,
@@ -1061,6 +1217,15 @@ int main(void)
     server_address.sin_port =
         htons(PORT);
 
+    /*
+     * [Lecture 03: bind()]
+     * Server step 2: bind() assigns the local address (IP + port) to the
+     * socket. A new socket has no port, and a server needs its fixed
+     * well-known one. Arguments: the socket, a pointer to the address
+     * cast to the generic struct sockaddr * (all socket functions take
+     * that type), and the structure size. Returns 0 on success, -1 on
+     * failure.
+     */
     if (bind(server_fd,
              (struct sockaddr *)&server_address,
              sizeof(server_address)) < 0) {
@@ -1073,6 +1238,13 @@ int main(void)
         return 1;
     }
 
+    /*
+     * [Lecture 03: listen()]
+     * Server step 3: listen() marks the socket as passive, i.e. ready to
+     * accept incoming connections. The second argument is the backlog,
+     * the length of the queue of waiting connections the kernel keeps
+     * (MAX_CLIENTS = 5, the historical value).
+     */
     if (listen(server_fd,
                MAX_CLIENTS) < 0) {
 
@@ -1102,6 +1274,19 @@ int main(void)
 
     while (1) {
 
+        /*
+         * [Lecture 03/02: accept() and the value-result argument]
+         * Server step 4 (repeated forever): accept() takes the next
+         * completed connection and returns a BRAND-NEW descriptor
+         * (client_fd) for that one client. The listening socket stays open
+         * for the next client.
+         *
+         * Value-result argument: the kernel fills client_address for us, so
+         * we pass a POINTER to the length. Before the call client_len holds
+         * the size of our buffer (the value); after the call the kernel
+         * stores how many bytes it used (the result). That is why client_len
+         * is reset to sizeof(...) on every loop pass.
+         */
         struct sockaddr_in client_address;
         socklen_t client_len =
             sizeof(client_address);
@@ -1111,6 +1296,13 @@ int main(void)
                    (struct sockaddr *)&client_address,
                    &client_len);
 
+        /*
+         * [Lecture 04: interrupted system calls (EINTR)]
+         * accept() is a slow system call: it can block for a long time, and
+         * if a signal arrives while it waits it may fail with errno = EINTR.
+         * That is not a real error, so we simply call accept() again. Any
+         * other error is printed and we keep serving.
+         */
         if (client_fd < 0) {
 
             if (errno == EINTR)
@@ -1120,6 +1312,13 @@ int main(void)
             continue;
         }
 
+        /*
+         * [Lecture 05: limiting the number of clients]
+         * Counts a client slot: at most MAX_CLIENTS clients are served at
+         * once (semaphores themselves are not in the lectures; think of it
+         * as a counter of free slots). Limiting connections is one of the
+         * lecture's denial-of-service defences.
+         */
         sem_wait(&client_slots);
 
         ClientContext *ctx =
@@ -1136,6 +1335,13 @@ int main(void)
 
         ctx->fd = client_fd;
 
+        /*
+         * [Lecture 02: inet_ntop()]
+         * inet_ntop() converts the client's binary IPv4 address back to text
+         * (e.g. "127.0.0.1") for logging. The size of the destination buffer
+         * is passed so it cannot overflow; client_ip is
+         * char[INET_ADDRSTRLEN] (16 bytes, enough for an IPv4 string).
+         */
         inet_ntop(AF_INET,
                   &client_address.sin_addr,
                   ctx->client_ip,
@@ -1150,6 +1356,17 @@ int main(void)
 
         pthread_t thread;
 
+        /*
+         * [Lecture 04: concurrent server, thread per client]
+         * Same shape as the lecture's fork() server: the main loop (the
+         * 'parent') only accepts connections, and each client gets its own
+         * worker (here a thread running client_handler instead of a forked
+         * child). Then the loop returns to accept() to wait for the next
+         * client.
+         *
+         * If the thread cannot be created, the connected socket is closed
+         * and the slot released, so no descriptor is leaked.
+         */
         if (pthread_create(&thread,
                            NULL,
                            client_handler,
@@ -1166,6 +1383,13 @@ int main(void)
             continue;
         }
 
+        /*
+         * [Lecture 04: cleaning up finished workers]
+         * A detached thread is cleaned up automatically by the OS when it
+         * ends, so main never has to wait for it. This plays the role that
+         * wait()/waitpid() with SIGCHLD played in the fork version to avoid
+         * zombie processes.
+         */
         pthread_detach(thread);
     }
 
